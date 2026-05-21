@@ -10,7 +10,7 @@ RUN dotnet publish -c Release -o /app/publish /p:UseAppHost=false
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 WORKDIR /app
 
-ENV ASPNETCORE_URLS=http://+:3000
+ENV ASPNETCORE_URLS=http://+:4000
 ENV DOTNET_EnableDiagnostics=0
 ENV DOTNET_GCServer=1
 
