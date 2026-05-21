@@ -1,7 +1,7 @@
 services:
   rola-api:
     build:
-      context: ./src/Rora.Gateway.Api
+      context: ./src/Rola.Gateway.Api
       dockerfile: Dockerfile
     container_name: rola-api
     ports:
