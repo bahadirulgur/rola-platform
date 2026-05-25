@@ -3,10 +3,14 @@ services:
     build:
       context: ./src/Rola.Gateway.Api
       dockerfile: Dockerfile
+
     container_name: rola-api
-    ports:
-      - "3000:3000"
+
+    expose:
+      - "3000"
+
     environment:
       ASPNETCORE_URLS: "http://+:3000"
       OPENAI_API_KEY: "${OPENAI_API_KEY}"
+
     restart: unless-stopped
