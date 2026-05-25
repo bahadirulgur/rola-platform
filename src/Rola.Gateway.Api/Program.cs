@@ -23,7 +23,7 @@ app.MapGet("/", () => Results.Json(new
 {
     ok = true,
     service = "rola-gateway-api",
-    version = "1.0.1"
+    version = "1.0.2"
 }));
 
 app.MapGet("/health", () => Results.Json(new
@@ -155,7 +155,6 @@ public static class RobotSessionHandler
 
         var helloJson = await WebSocketJsonHelper.ReceiveFullTextAsync(
             robotSocket,
-            logger,
             cancellationToken);
 
         if (string.IsNullOrWhiteSpace(helloJson))
@@ -220,6 +219,7 @@ public static class RobotSessionHandler
 
 public sealed class OpenAiRealtimeBridge
 {
+    private const int AudioBatchTargetBytes = 9_600;
     private readonly string _apiKey;
 
     public OpenAiRealtimeBridge(IConfiguration configuration)
@@ -282,6 +282,8 @@ public sealed class OpenAiRealtimeBridge
         ILogger logger,
         CancellationToken cancellationToken)
     {
+        using var audioBatch = new MemoryStream(32 * 1024);
+
         while (!cancellationToken.IsCancellationRequested &&
                openAiSocket.State == WebSocketState.Open &&
                robotSocket.State == WebSocketState.Open)
@@ -292,7 +294,6 @@ public sealed class OpenAiRealtimeBridge
             {
                 json = await WebSocketJsonHelper.ReceiveFullTextAsync(
                     openAiSocket,
-                    logger,
                     cancellationToken);
             }
             catch (OperationCanceledException)
@@ -313,143 +314,141 @@ public sealed class OpenAiRealtimeBridge
             if (string.IsNullOrWhiteSpace(json))
                 break;
 
-            JsonDocument doc;
+            using JsonDocument doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
 
-            try
+            var type = root.TryGetProperty("type", out var typeEl)
+                ? typeEl.GetString()
+                : null;
+
+            if (string.IsNullOrWhiteSpace(type))
+                continue;
+
+            logger.LogInformation("[OpenAI EVENT] {Type}", type);
+
+            if (type == "session.created")
             {
-                doc = JsonDocument.Parse(json);
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "[OpenAI] invalid json length={Length}", json.Length);
+                await SendSessionUpdateAsync(openAiSocket, tenant, cancellationToken);
                 continue;
             }
 
-            using (doc)
+            if (type == "session.updated")
             {
-                var root = doc.RootElement;
-
-                var type = root.TryGetProperty("type", out var typeEl)
-                    ? typeEl.GetString()
-                    : null;
-
-                if (string.IsNullOrWhiteSpace(type))
-                    continue;
-
-                logger.LogInformation("[OpenAI EVENT] {Type}", type);
-
-                if (type == "session.created")
+                await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
                 {
-                    await SendSessionUpdateAsync(openAiSocket, tenant, cancellationToken);
-                    continue;
-                }
+                    type = "gateway.ready"
+                }, cancellationToken);
 
-                if (type == "session.updated")
+                continue;
+            }
+
+            if (type == "error")
+            {
+                await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
                 {
-                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
+                    type = "gateway.error",
+                    source = "openai",
+                    message = root.ToString()
+                }, cancellationToken);
+
+                continue;
+            }
+
+            if (type == "input_audio_buffer.speech_started")
+            {
+                await WebSocketJsonHelper.SendJsonAsync(robotSocket, new { type }, cancellationToken);
+                continue;
+            }
+
+            if (type == "input_audio_buffer.speech_stopped")
+            {
+                await WebSocketJsonHelper.SendJsonAsync(robotSocket, new { type }, cancellationToken);
+                continue;
+            }
+
+            if (type == "input_audio_buffer.committed")
+            {
+                await WebSocketJsonHelper.SendJsonAsync(robotSocket, new { type }, cancellationToken);
+                continue;
+            }
+
+            if (type == "response.created")
+            {
+                await WebSocketJsonHelper.SendJsonAsync(robotSocket, new { type }, cancellationToken);
+                continue;
+            }
+
+            if (type == "response.output_audio.delta" &&
+                root.TryGetProperty("delta", out var deltaEl))
+            {
+                var base64 = deltaEl.GetString();
+
+                if (!string.IsNullOrWhiteSpace(base64))
+                {
+                    var pcm = Convert.FromBase64String(base64);
+                    audioBatch.Write(pcm, 0, pcm.Length);
+
+                    if (audioBatch.Length >= AudioBatchTargetBytes)
                     {
-                        type = "gateway.ready"
-                    }, cancellationToken);
-
-                    continue;
-                }
-
-                if (type == "error")
-                {
-                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
-                    {
-                        type = "gateway.error",
-                        source = "openai",
-                        message = root.ToString()
-                    }, cancellationToken);
-
-                    continue;
-                }
-
-                if (type == "input_audio_buffer.speech_started")
-                {
-                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
-                    {
-                        type
-                    }, cancellationToken);
-
-                    continue;
-                }
-
-                if (type == "input_audio_buffer.speech_stopped")
-                {
-                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
-                    {
-                        type
-                    }, cancellationToken);
-
-                    continue;
-                }
-
-                if (type == "input_audio_buffer.committed")
-                {
-                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
-                    {
-                        type
-                    }, cancellationToken);
-
-                    continue;
-                }
-
-                if (type == "response.created")
-                {
-                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
-                    {
-                        type
-                    }, cancellationToken);
-
-                    continue;
-                }
-
-                if (type == "response.output_audio.delta" &&
-                    root.TryGetProperty("delta", out var deltaEl))
-                {
-                    var base64 = deltaEl.GetString();
-
-                    if (!string.IsNullOrWhiteSpace(base64))
-                    {
-                        var pcm = Convert.FromBase64String(base64);
-
-                        await robotSocket.SendAsync(
-                            pcm,
-                            WebSocketMessageType.Binary,
-                            true,
+                        await FlushAudioBatchAsync(
+                            robotSocket,
+                            audioBatch,
                             cancellationToken);
                     }
-
-                    continue;
                 }
 
-                if (type == "response.output_audio.done")
+                continue;
+            }
+
+            if (type == "response.output_audio.done")
+            {
+                await FlushAudioBatchAsync(
+                    robotSocket,
+                    audioBatch,
+                    cancellationToken);
+
+                await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
                 {
-                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
-                    {
-                        type = "audio.done"
-                    }, cancellationToken);
+                    type = "audio.done"
+                }, cancellationToken);
 
-                    continue;
-                }
+                continue;
+            }
 
-                if (type == "response.done")
+            if (type == "response.done")
+            {
+                await FlushAudioBatchAsync(
+                    robotSocket,
+                    audioBatch,
+                    cancellationToken);
+
+                await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
                 {
-                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
-                    {
-                        type = "response.done"
-                    }, cancellationToken);
+                    type = "response.done"
+                }, cancellationToken);
 
-                    continue;
-                }
-
-                // ÖNEMLİ:
-                // response.output_audio_transcript.delta gibi çok sık gelen text eventleri
-                // ESP'ye göndermiyoruz. Bunlar ESP websocket loop'unu yoruyor.
+                continue;
             }
         }
+    }
+
+    private static async Task FlushAudioBatchAsync(
+        WebSocket robotSocket,
+        MemoryStream audioBatch,
+        CancellationToken cancellationToken)
+    {
+        if (audioBatch.Length <= 0)
+            return;
+
+        var buffer = audioBatch.ToArray();
+
+        audioBatch.SetLength(0);
+
+        await robotSocket.SendAsync(
+            buffer,
+            WebSocketMessageType.Binary,
+            true,
+            cancellationToken);
     }
 
     private static async Task PumpRobotToOpenAiAsync(
@@ -468,7 +467,6 @@ public sealed class OpenAiRealtimeBridge
             {
                 message = await WebSocketJsonHelper.ReceiveFullMessageAsync(
                     robotSocket,
-                    logger,
                     cancellationToken);
             }
             catch (OperationCanceledException)
@@ -555,11 +553,11 @@ public sealed class OpenAiRealtimeBridge
                         turn_detection = new
                         {
                             type = "server_vad",
-                            threshold = 0.5,
+                            threshold = 0.55,
                             prefix_padding_ms = 300,
-                            silence_duration_ms = 700,
+                            silence_duration_ms = 800,
                             create_response = true,
-                            interrupt_response = true
+                            interrupt_response = false
                         }
                     },
                     output = new
@@ -606,10 +604,9 @@ public static class WebSocketJsonHelper
 {
     public static async Task<string?> ReceiveFullTextAsync(
         WebSocket socket,
-        ILogger logger,
         CancellationToken cancellationToken)
     {
-        var message = await ReceiveFullMessageAsync(socket, logger, cancellationToken);
+        var message = await ReceiveFullMessageAsync(socket, cancellationToken);
 
         if (message.MessageType == WebSocketMessageType.Close)
             return null;
@@ -622,7 +619,6 @@ public static class WebSocketJsonHelper
 
     public static async Task<WebSocketMessage> ReceiveFullMessageAsync(
         WebSocket socket,
-        ILogger logger,
         CancellationToken cancellationToken)
     {
         var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
