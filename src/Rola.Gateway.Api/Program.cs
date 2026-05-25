@@ -219,7 +219,7 @@ public static class RobotSessionHandler
 
 public sealed class OpenAiRealtimeBridge
 {
-    private const int AudioBatchTargetBytes = 9_600;
+    private const int AudioBatchTargetBytes = 19200;
     private readonly string _apiKey;
 
     public OpenAiRealtimeBridge(IConfiguration configuration)
