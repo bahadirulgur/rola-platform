@@ -16,6 +16,6 @@ ENV DOTNET_GCServer=1
 
 COPY --from=build /app/publish .
 
-EXPOSE 3001
+EXPOSE 3000
 
 ENTRYPOINT ["dotnet", "Rola.Gateway.Api.dll"]
