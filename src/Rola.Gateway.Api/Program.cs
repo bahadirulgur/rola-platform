@@ -23,7 +23,7 @@ app.MapGet("/", () => Results.Json(new
 {
     ok = true,
     service = "rola-gateway-api",
-    version = "1.0.2"
+    version = "1.0.3"
 }));
 
 app.MapGet("/health", () => Results.Json(new
@@ -219,7 +219,6 @@ public static class RobotSessionHandler
 
 public sealed class OpenAiRealtimeBridge
 {
-    private const int AudioBatchTargetBytes = 2400;
     private readonly string _apiKey;
 
     public OpenAiRealtimeBridge(IConfiguration configuration)
@@ -282,8 +281,6 @@ public sealed class OpenAiRealtimeBridge
         ILogger logger,
         CancellationToken cancellationToken)
     {
-        using var audioBatch = new MemoryStream(32 * 1024);
-
         while (!cancellationToken.IsCancellationRequested &&
                openAiSocket.State == WebSocketState.Open &&
                robotSocket.State == WebSocketState.Open)
@@ -385,16 +382,13 @@ public sealed class OpenAiRealtimeBridge
 
                 if (!string.IsNullOrWhiteSpace(base64))
                 {
-                    var pcm = Convert.FromBase64String(base64);
-                    audioBatch.Write(pcm, 0, pcm.Length);
-
-                    if (audioBatch.Length >= AudioBatchTargetBytes)
+                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
                     {
-                        await FlushAudioBatchAsync(
-                            robotSocket,
-                            audioBatch,
-                            cancellationToken);
-                    }
+                        type = "audio.pcm",
+                        audio = base64
+                    }, cancellationToken);
+
+                    await Task.Delay(5, cancellationToken);
                 }
 
                 continue;
@@ -402,11 +396,6 @@ public sealed class OpenAiRealtimeBridge
 
             if (type == "response.output_audio.done")
             {
-                await FlushAudioBatchAsync(
-                    robotSocket,
-                    audioBatch,
-                    cancellationToken);
-
                 await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
                 {
                     type = "audio.done"
@@ -417,11 +406,6 @@ public sealed class OpenAiRealtimeBridge
 
             if (type == "response.done")
             {
-                await FlushAudioBatchAsync(
-                    robotSocket,
-                    audioBatch,
-                    cancellationToken);
-
                 await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
                 {
                     type = "response.done"
@@ -431,30 +415,6 @@ public sealed class OpenAiRealtimeBridge
             }
         }
     }
-
-    private static async Task FlushAudioBatchAsync(
-    WebSocket robotSocket,
-    MemoryStream audioBatch,
-    CancellationToken cancellationToken)
-{
-    if (audioBatch.Length <= 0)
-        return;
-
-    var buffer = audioBatch.ToArray();
-
-    audioBatch.SetLength(0);
-
-    if (robotSocket.State != WebSocketState.Open)
-        return;
-
-    await robotSocket.SendAsync(
-        buffer,
-        WebSocketMessageType.Binary,
-        true,
-        cancellationToken);
-
-    await Task.Delay(20, cancellationToken);
-}
 
     private static async Task PumpRobotToOpenAiAsync(
         WebSocket robotSocket,
