@@ -219,7 +219,7 @@ public static class RobotSessionHandler
 
 public sealed class OpenAiRealtimeBridge
 {
-    private const int AudioBatchTargetBytes = 4800;
+    private const int AudioBatchTargetBytes = 2400;
     private readonly string _apiKey;
 
     public OpenAiRealtimeBridge(IConfiguration configuration)
@@ -433,23 +433,28 @@ public sealed class OpenAiRealtimeBridge
     }
 
     private static async Task FlushAudioBatchAsync(
-        WebSocket robotSocket,
-        MemoryStream audioBatch,
-        CancellationToken cancellationToken)
-    {
-        if (audioBatch.Length <= 0)
-            return;
+    WebSocket robotSocket,
+    MemoryStream audioBatch,
+    CancellationToken cancellationToken)
+{
+    if (audioBatch.Length <= 0)
+        return;
 
-        var buffer = audioBatch.ToArray();
+    var buffer = audioBatch.ToArray();
 
-        audioBatch.SetLength(0);
+    audioBatch.SetLength(0);
 
-        await robotSocket.SendAsync(
-            buffer,
-            WebSocketMessageType.Binary,
-            true,
-            cancellationToken);
-    }
+    if (robotSocket.State != WebSocketState.Open)
+        return;
+
+    await robotSocket.SendAsync(
+        buffer,
+        WebSocketMessageType.Binary,
+        true,
+        cancellationToken);
+
+    await Task.Delay(20, cancellationToken);
+}
 
     private static async Task PumpRobotToOpenAiAsync(
         WebSocket robotSocket,
