@@ -16,14 +16,14 @@ var app = builder.Build();
 
 app.UseWebSockets(new WebSocketOptions
 {
-    KeepAliveInterval = TimeSpan.FromSeconds(20)
+    KeepAliveInterval = TimeSpan.FromSeconds(15)
 });
 
 app.MapGet("/", () => Results.Json(new
 {
     ok = true,
     service = "rola-gateway-api",
-    version = "1.0.0"
+    version = "1.0.1"
 }));
 
 app.MapGet("/health", () => Results.Json(new
@@ -89,8 +89,6 @@ public sealed class TenantConfigService
 {
     public TenantConfig Resolve(string tenantCode)
     {
-        // Faz 1: hard-coded demo.
-        // Faz 2: PostgreSQL + Redis cache yapacağız.
         return tenantCode switch
         {
             "demo-gelinlikci" => new TenantConfig(
@@ -155,11 +153,41 @@ public static class RobotSessionHandler
     {
         logger.LogInformation("[Robot] connected");
 
-        RobotHelloMessage? hello = await ReceiveHelloAsync(robotSocket, cancellationToken);
+        var helloJson = await WebSocketJsonHelper.ReceiveFullTextAsync(
+            robotSocket,
+            logger,
+            cancellationToken);
+
+        if (string.IsNullOrWhiteSpace(helloJson))
+        {
+            logger.LogWarning("[Robot] empty hello");
+            return;
+        }
+
+        RobotHelloMessage? hello;
+
+        try
+        {
+            hello = JsonSerializer.Deserialize<RobotHelloMessage>(
+                helloJson,
+                JsonOptions.Default);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "[Robot] invalid hello json");
+
+            await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
+            {
+                type = "error",
+                message = "Invalid hello json"
+            }, cancellationToken);
+
+            return;
+        }
 
         if (hello is null || !string.Equals(hello.Type, "hello", StringComparison.OrdinalIgnoreCase))
         {
-            await SendJsonAsync(robotSocket, new
+            await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
             {
                 type = "error",
                 message = "First message must be hello"
@@ -177,7 +205,7 @@ public static class RobotSessionHandler
             hello.Audio?.Format,
             hello.Audio?.SampleRate);
 
-        await SendJsonAsync(robotSocket, new
+        await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
         {
             type = "hello.accepted",
             deviceId = hello.DeviceId,
@@ -187,48 +215,6 @@ public static class RobotSessionHandler
         }, cancellationToken);
 
         await bridge.RunAsync(robotSocket, hello, tenant, logger, cancellationToken);
-    }
-
-    private static async Task<RobotHelloMessage?> ReceiveHelloAsync(
-        WebSocket socket,
-        CancellationToken cancellationToken)
-    {
-        var buffer = ArrayPool<byte>.Shared.Rent(16 * 1024);
-
-        try
-        {
-            var result = await socket.ReceiveAsync(
-                buffer.AsMemory(0, buffer.Length),
-                cancellationToken);
-
-            if (result.MessageType != WebSocketMessageType.Text)
-                return null;
-
-            var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
-
-            return JsonSerializer.Deserialize<RobotHelloMessage>(
-                json,
-                JsonOptions.Default);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-        }
-    }
-
-    private static Task SendJsonAsync(
-        WebSocket socket,
-        object payload,
-        CancellationToken cancellationToken)
-    {
-        var json = JsonSerializer.Serialize(payload, JsonOptions.Default);
-        var bytes = Encoding.UTF8.GetBytes(json);
-
-        return socket.SendAsync(
-            bytes,
-            WebSocketMessageType.Text,
-            true,
-            cancellationToken);
     }
 }
 
@@ -253,6 +239,7 @@ public sealed class OpenAiRealtimeBridge
         using var openAiSocket = new ClientWebSocket();
 
         openAiSocket.Options.SetRequestHeader("Authorization", $"Bearer {_apiKey}");
+        openAiSocket.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);
 
         var uri = new Uri("wss://api.openai.com/v1/realtime?model=gpt-realtime");
 
@@ -260,34 +247,32 @@ public sealed class OpenAiRealtimeBridge
 
         logger.LogInformation("[OpenAI] connected");
 
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
         var fromOpenAi = PumpOpenAiToRobotAsync(
             openAiSocket,
             robotSocket,
             tenant,
             logger,
-            cancellationToken);
+            linkedCts.Token);
 
         var fromRobot = PumpRobotToOpenAiAsync(
             robotSocket,
             openAiSocket,
             logger,
-            cancellationToken);
+            linkedCts.Token);
 
-        await Task.WhenAny(fromOpenAi, fromRobot);
+        var completed = await Task.WhenAny(fromOpenAi, fromRobot);
 
-        try
+        if (completed.IsFaulted)
         {
-            if (robotSocket.State == WebSocketState.Open)
-                await robotSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "session ended", CancellationToken.None);
+            logger.LogError(completed.Exception, "[Bridge] pump failed");
         }
-        catch { }
 
-        try
-        {
-            if (openAiSocket.State == WebSocketState.Open)
-                await openAiSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "session ended", CancellationToken.None);
-        }
-        catch { }
+        linkedCts.Cancel();
+
+        await SafeCloseAsync(robotSocket, "session ended");
+        await SafeCloseAsync(openAiSocket, "session ended");
     }
 
     private static async Task PumpOpenAiToRobotAsync(
@@ -297,31 +282,58 @@ public sealed class OpenAiRealtimeBridge
         ILogger logger,
         CancellationToken cancellationToken)
     {
-        var buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
-
-        try
+        while (!cancellationToken.IsCancellationRequested &&
+               openAiSocket.State == WebSocketState.Open &&
+               robotSocket.State == WebSocketState.Open)
         {
-            while (!cancellationToken.IsCancellationRequested &&
-                   openAiSocket.State == WebSocketState.Open &&
-                   robotSocket.State == WebSocketState.Open)
+            string? json;
+
+            try
             {
-                var result = await openAiSocket.ReceiveAsync(
-                    buffer.AsMemory(0, buffer.Length),
+                json = await WebSocketJsonHelper.ReceiveFullTextAsync(
+                    openAiSocket,
+                    logger,
                     cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (WebSocketException ex)
+            {
+                logger.LogWarning(ex, "[OpenAI] websocket closed while receiving");
+                break;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "[OpenAI] receive failed");
+                break;
+            }
 
-                if (result.MessageType == WebSocketMessageType.Close)
-                    break;
+            if (string.IsNullOrWhiteSpace(json))
+                break;
 
-                var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
+            JsonDocument doc;
 
-                using var doc = JsonDocument.Parse(json);
+            try
+            {
+                doc = JsonDocument.Parse(json);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "[OpenAI] invalid json length={Length}", json.Length);
+                continue;
+            }
+
+            using (doc)
+            {
                 var root = doc.RootElement;
 
                 var type = root.TryGetProperty("type", out var typeEl)
                     ? typeEl.GetString()
                     : null;
 
-                if (type is null)
+                if (string.IsNullOrWhiteSpace(type))
                     continue;
 
                 logger.LogInformation("[OpenAI EVENT] {Type}", type);
@@ -334,7 +346,7 @@ public sealed class OpenAiRealtimeBridge
 
                 if (type == "session.updated")
                 {
-                    await SendJsonAsync(robotSocket, new
+                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
                     {
                         type = "gateway.ready"
                     }, cancellationToken);
@@ -344,11 +356,51 @@ public sealed class OpenAiRealtimeBridge
 
                 if (type == "error")
                 {
-                    await SendJsonAsync(robotSocket, new
+                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
                     {
                         type = "gateway.error",
                         source = "openai",
-                        payload = root
+                        message = root.ToString()
+                    }, cancellationToken);
+
+                    continue;
+                }
+
+                if (type == "input_audio_buffer.speech_started")
+                {
+                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
+                    {
+                        type
+                    }, cancellationToken);
+
+                    continue;
+                }
+
+                if (type == "input_audio_buffer.speech_stopped")
+                {
+                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
+                    {
+                        type
+                    }, cancellationToken);
+
+                    continue;
+                }
+
+                if (type == "input_audio_buffer.committed")
+                {
+                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
+                    {
+                        type
+                    }, cancellationToken);
+
+                    continue;
+                }
+
+                if (type == "response.created")
+                {
+                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
+                    {
+                        type
                     }, cancellationToken);
 
                     continue;
@@ -375,7 +427,7 @@ public sealed class OpenAiRealtimeBridge
 
                 if (type == "response.output_audio.done")
                 {
-                    await SendJsonAsync(robotSocket, new
+                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
                     {
                         type = "audio.done"
                     }, cancellationToken);
@@ -383,19 +435,20 @@ public sealed class OpenAiRealtimeBridge
                     continue;
                 }
 
-                if (type.StartsWith("input_audio_buffer.", StringComparison.Ordinal) ||
-                    type.StartsWith("response.", StringComparison.Ordinal))
+                if (type == "response.done")
                 {
-                    await SendJsonAsync(robotSocket, new
+                    await WebSocketJsonHelper.SendJsonAsync(robotSocket, new
                     {
-                        type
+                        type = "response.done"
                     }, cancellationToken);
+
+                    continue;
                 }
+
+                // ÖNEMLİ:
+                // response.output_audio_transcript.delta gibi çok sık gelen text eventleri
+                // ESP'ye göndermiyoruz. Bunlar ESP websocket loop'unu yoruyor.
             }
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
@@ -405,47 +458,52 @@ public sealed class OpenAiRealtimeBridge
         ILogger logger,
         CancellationToken cancellationToken)
     {
-        var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
-
-        try
+        while (!cancellationToken.IsCancellationRequested &&
+               robotSocket.State == WebSocketState.Open &&
+               openAiSocket.State == WebSocketState.Open)
         {
-            while (!cancellationToken.IsCancellationRequested &&
-                   robotSocket.State == WebSocketState.Open &&
-                   openAiSocket.State == WebSocketState.Open)
+            WebSocketMessage message;
+
+            try
             {
-                var result = await robotSocket.ReceiveAsync(
-                    buffer.AsMemory(0, buffer.Length),
+                message = await WebSocketJsonHelper.ReceiveFullMessageAsync(
+                    robotSocket,
+                    logger,
+                    cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (WebSocketException ex)
+            {
+                logger.LogWarning(ex, "[Robot] websocket closed while receiving");
+                break;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "[Robot] receive failed");
+                break;
+            }
+
+            if (message.MessageType == WebSocketMessageType.Close)
+                break;
+
+            if (message.MessageType == WebSocketMessageType.Text)
+            {
+                await openAiSocket.SendAsync(
+                    message.Payload,
+                    WebSocketMessageType.Text,
+                    true,
                     cancellationToken);
 
-                if (result.MessageType == WebSocketMessageType.Close)
-                    break;
-
-                if (result.MessageType == WebSocketMessageType.Text)
-                {
-                    var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
-
-                    // Robot şu an OpenAI formatında JSON gönderebilir:
-                    // input_audio_buffer.append vb.
-                    await openAiSocket.SendAsync(
-                        Encoding.UTF8.GetBytes(text),
-                        WebSocketMessageType.Text,
-                        true,
-                        cancellationToken);
-
-                    continue;
-                }
-
-                if (result.MessageType == WebSocketMessageType.Binary)
-                {
-                    // Faz 2'de Opus binary protokolünü burada işleyeceğiz.
-                    // Şimdilik binary robot input'u OpenAI'ye direkt gönderilmiyor.
-                    logger.LogDebug("[Robot] binary audio received length={Length}", result.Count);
-                }
+                continue;
             }
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
+
+            if (message.MessageType == WebSocketMessageType.Binary)
+            {
+                logger.LogDebug("[Robot] binary input ignored length={Length}", message.Payload.Length);
+            }
         }
     }
 
@@ -517,10 +575,90 @@ public sealed class OpenAiRealtimeBridge
             }
         };
 
-        await SendJsonAsync(socket, payload, cancellationToken);
+        await WebSocketJsonHelper.SendJsonAsync(socket, payload, cancellationToken);
     }
 
-    private static Task SendJsonAsync(
+    private static async Task SafeCloseAsync(WebSocket socket, string reason)
+    {
+        try
+        {
+            if (socket.State == WebSocketState.Open ||
+                socket.State == WebSocketState.CloseReceived)
+            {
+                await socket.CloseAsync(
+                    WebSocketCloseStatus.NormalClosure,
+                    reason,
+                    CancellationToken.None);
+            }
+        }
+        catch
+        {
+            // ignored
+        }
+    }
+}
+
+public sealed record WebSocketMessage(
+    WebSocketMessageType MessageType,
+    byte[] Payload);
+
+public static class WebSocketJsonHelper
+{
+    public static async Task<string?> ReceiveFullTextAsync(
+        WebSocket socket,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        var message = await ReceiveFullMessageAsync(socket, logger, cancellationToken);
+
+        if (message.MessageType == WebSocketMessageType.Close)
+            return null;
+
+        if (message.MessageType != WebSocketMessageType.Text)
+            return null;
+
+        return Encoding.UTF8.GetString(message.Payload);
+    }
+
+    public static async Task<WebSocketMessage> ReceiveFullMessageAsync(
+        WebSocket socket,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+
+        try
+        {
+            using var ms = new MemoryStream(64 * 1024);
+
+            while (true)
+            {
+                var result = await socket.ReceiveAsync(
+                    buffer.AsMemory(0, buffer.Length),
+                    cancellationToken);
+
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    return new WebSocketMessage(WebSocketMessageType.Close, []);
+                }
+
+                ms.Write(buffer, 0, result.Count);
+
+                if (result.EndOfMessage)
+                {
+                    return new WebSocketMessage(
+                        result.MessageType,
+                        ms.ToArray());
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    public static Task SendJsonAsync(
         WebSocket socket,
         object payload,
         CancellationToken cancellationToken)
